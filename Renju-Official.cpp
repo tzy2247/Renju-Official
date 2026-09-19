@@ -15,6 +15,7 @@
 #include <cctype>
 #include <tuple>
 #include <memory>
+#include <utility>
 
 using namespace std;
 
@@ -68,7 +69,6 @@ map<OpeningKey, OpeningVal> OPENINGS_DB = {
     {{{8, 8}, {6, 5}}, {"名月", "WHITE_WIN"}}, {{{8, 8}, {5, 5}}, {"彗星", "WHITE_WIN"}},
 };
 
-// 与 Python OPENINGS_DB 的插入顺序一致，本地测试枚举开局时使用
 static const vector<OpeningKey> OPENINGS_ORDER = {
     {{7, 8}, {7, 9}}, {{7, 8}, {8, 9}}, {{7, 8}, {9, 9}}, {{7, 8}, {8, 8}},
     {{7, 8}, {9, 8}}, {{7, 8}, {8, 7}}, {{7, 8}, {9, 7}}, {{7, 8}, {7, 6}},
@@ -713,6 +713,21 @@ set<Pos> _line_vicinity_fb(FastBoard& fb, int x, int y) {
     return cells;
 }
 
+// ================= 4.5 四着法质量 =================
+int _four_quality(const FastBoard& fb, const Pos& p, int color) {
+    char me = (color == BLACK) ? B1 : B2;
+    for (auto& q : CELL_LINES[p.first][p.second]) {
+        const string& raw = fb.line_strings[q.first];
+        int ci = q.second, n = (int)raw.size();
+        int left = 0;
+        while (ci - 1 - left >= 0 && raw[ci - 1 - left] == me) ++left;
+        int right = 0;
+        while (ci + 1 + right < n && raw[ci + 1 + right] == me) ++right;
+        if (left + right == 3) return 1;   // 落子后恰成 4 连 (连冲四)
+    }
+    return 0; // 跳四或非四
+}
+
 // ================= 5. 评估 =================
 double _attack_val(FastBoard& fb, int x, int y, int color) {
     double v = 0.0;
@@ -910,7 +925,16 @@ optional<vector<Pos>> search_vcf(FastBoard& fb, int color, int depth, const Dead
     }
     int opp = 1 - color;
     auto fours = four_moves_full(fb, color);
-    sort(fours.begin(), fours.end(), [](const pair<Pos, int>& a, const pair<Pos, int>& b) { return a.second > b.second; });
+
+    // 【跳四修复】双四 > 连冲四 > 跳四 > 估值
+    // 注意：a.first 是 Pos，需要拆解为 a.first.first 和 a.first.second 传给 quick_eval_fb
+    sort(fours.begin(), fours.end(), [&](const pair<Pos, int>& a, const pair<Pos, int>& b) {
+        if (a.second != b.second) return a.second > b.second;
+        int qa = _four_quality(fb, a.first, color);
+        int qb = _four_quality(fb, b.first, color);
+        if (qa != qb) return qa > qb;
+        return quick_eval_fb(fb, a.first.first, a.first.second, color) > quick_eval_fb(fb, b.first.first, b.first.second, color);
+        });
 
     for (auto& item : fours) {
         Pos atk = item.first;
@@ -974,7 +998,15 @@ optional<vector<Pos>> search_vct(FastBoard& fb, int color, int depth, const Dead
     int opp = 1 - color;
 
     auto fours_sorted = four_moves_full(fb, color);
-    sort(fours_sorted.begin(), fours_sorted.end(), [](const pair<Pos, int>& a, const pair<Pos, int>& b) { return a.second > b.second; });
+    // 【跳四修复】双四 > 连冲四 > 跳四 > 估值
+    sort(fours_sorted.begin(), fours_sorted.end(), [&](const pair<Pos, int>& a, const pair<Pos, int>& b) {
+        if (a.second != b.second) return a.second > b.second;
+        int qa = _four_quality(fb, a.first, color);
+        int qb = _four_quality(fb, b.first, color);
+        if (qa != qb) return qa > qb;
+        return quick_eval_fb(fb, a.first.first, a.first.second, color) > quick_eval_fb(fb, b.first.first, b.first.second, color);
+        });
+
     vector<Pos> atks;
     set<Pos> seen_atk;
     for (auto& item : fours_sorted) {
@@ -1084,6 +1116,159 @@ bool vct_disproved(FastBoard& fb, int color, int max_depth, const Deadline& dead
     }
 }
 
+// ================= 6.8 VCF 完整证明树 =================
+struct MateNode {
+    Pos atk{ -1, -1 };
+    bool terminal{ false };
+    Pos win_five{ -1, -1 };
+    map<Pos, MateNode> replies;
+    MateNode() = default;
+    MateNode(const Pos& a, bool t, const Pos& w) : atk(a), terminal(t), win_five(w) {}
+};
+
+optional<MateNode> search_vcf_tree(FastBoard& fb, int color, int depth,
+    const Deadline& deadline, long long& node_budget)
+{
+    deadline.check();
+    if (--node_budget < 0) throw TimeoutException();
+
+    auto fives = five_moves(fb, color);
+    if (!fives.empty()) return MateNode(fives[0], true, fives[0]);
+    if (depth <= 0) return nullopt;
+
+    int opp = 1 - color;
+    auto fours = four_moves_full(fb, color);
+
+    // 【跳四修复】双四 > 连冲四 > 跳四 > 估值
+    sort(fours.begin(), fours.end(), [&](const pair<Pos, int>& a, const pair<Pos, int>& b) {
+        if (a.second != b.second) return a.second > b.second;
+        int qa = _four_quality(fb, a.first, color);
+        int qb = _four_quality(fb, b.first, color);
+        if (qa != qb) return qa > qb;
+        return quick_eval_fb(fb, a.first.first, a.first.second, color)
+                    > quick_eval_fb(fb, b.first.first, b.first.second, color);
+        });
+
+    for (auto& item : fours) {
+        const Pos& atk = item.first;
+        deadline.check();
+        BoardGuard guard(fb, atk.first, atk.second, color);
+
+        if (!five_moves(fb, opp).empty()) continue;
+
+        auto five_pts = five_point_cells_fb(fb, atk.first, atk.second, color);
+        if (five_pts.empty()) continue;
+
+        MateNode node(atk, false, *five_pts.begin());
+        bool all_win = true;
+
+        for (auto& d : five_pts) {
+            deadline.check();
+            BoardGuard guard2(fb, d.first, d.second, opp);
+
+            if (is_win_at_fb(fb, d.first, d.second, opp)) { all_win = false; break; }
+
+            if (opp == BLACK) {
+                auto res = analyze_move_k(fb, d.first, d.second, opp);
+                if (get<1>(res)) continue;
+            }
+
+            auto sub = search_vcf_tree(fb, color, depth - 1, deadline, node_budget);
+            if (!sub.has_value()) { all_win = false; break; }
+            node.replies[d] = move(*sub);
+        }
+        if (all_win) return node;
+    }
+    return nullopt;
+}
+
+bool verify_mate_tree(FastBoard& fb, const MateNode& node, int color, const Deadline& dl) {
+    dl.check();
+    int opp = 1 - color;
+    if (fb.board[node.atk.first][node.atk.second] != EMPTY) return false;
+
+    BoardGuard g(fb, node.atk.first, node.atk.second, color);
+    bool atk_wins = is_win_at_fb(fb, node.atk.first, node.atk.second, color);
+    if (node.terminal) return atk_wins;
+    if (atk_wins) return false;
+    if (color == BLACK) {
+        auto res = analyze_move_k(fb, node.atk.first, node.atk.second, color);
+        if (get<1>(res)) return false;
+    }
+
+    auto five_pts = five_point_cells_fb(fb, node.atk.first, node.atk.second, color);
+    if (five_pts.empty()) return false;
+    if (five_pts.find(node.win_five) == five_pts.end()) return false;
+    if (!five_moves(fb, opp).empty()) return false;
+
+    set<Pos> defs = five_pts;
+    for (auto& p : fb.candidates()) defs.insert(p);
+
+    for (auto& d : defs) {
+        if (fb.board[d.first][d.second] != EMPTY) continue;
+        if (opp == BLACK && is_ban_move_fb(fb, d.first, d.second)) continue;
+
+        BoardGuard g2(fb, d.first, d.second, opp);
+        if (is_win_at_fb(fb, d.first, d.second, opp)) return false;
+
+        auto it = node.replies.find(d);
+        if (it != node.replies.end()) {
+            if (!verify_mate_tree(fb, it->second, color, dl)) return false;
+        }
+        else {
+            if (fb.board[node.win_five.first][node.win_five.second] != EMPTY) return false;
+            BoardGuard g3(fb, node.win_five.first, node.win_five.second, color);
+            if (!is_win_at_fb(fb, node.win_five.first, node.win_five.second, color))
+                return false;
+        }
+    }
+    return true;
+}
+
+// ================= 6.10 快速绝杀模式 =================
+static MateNode g_mate_dev_node;
+optional<MateNode> g_mate_root;
+const MateNode* g_mate_cur = nullptr;
+int g_mate_color = -1;
+
+void mate_mode_reset() { g_mate_root.reset(); g_mate_cur = nullptr; g_mate_color = -1; }
+bool mate_mode_active() { return g_mate_root.has_value(); }
+
+void mate_mode_notify(FastBoard& fb, Pos opp_move) {
+    if (!mate_mode_active() || g_mate_cur == nullptr) return;
+    if (fb.board[g_mate_cur->atk.first][g_mate_cur->atk.second] != g_mate_color) {
+        mate_mode_reset(); return;
+    }
+    if (g_mate_cur->terminal) return;
+    auto it = g_mate_cur->replies.find(opp_move);
+    if (it != g_mate_cur->replies.end()) {
+        g_mate_cur = &it->second;
+        return;
+    }
+    Pos w = g_mate_cur->win_five;
+    if (fb.board[w.first][w.second] != EMPTY) { mate_mode_reset(); return; }
+    BoardGuard g(fb, w.first, w.second, g_mate_color);
+    if (!is_win_at_fb(fb, w.first, w.second, g_mate_color)) { mate_mode_reset(); return; }
+    g_mate_dev_node = MateNode(w, true, w);
+    g_mate_cur = &g_mate_dev_node;
+}
+
+optional<Pos> mate_mode_move(FastBoard& fb, int color) {
+    if (!mate_mode_active() || g_mate_color != color || g_mate_cur == nullptr) return nullopt;
+    const MateNode* n = g_mate_cur;
+    if (fb.board[n->atk.first][n->atk.second] != EMPTY) return nullopt;
+    if (n->terminal) {
+        BoardGuard g(fb, n->atk.first, n->atk.second, color);
+        if (!is_win_at_fb(fb, n->atk.first, n->atk.second, color)) return nullopt;
+    }
+    else {
+        if (color == BLACK && is_ban_move_fb(fb, n->atk.first, n->atk.second)) return nullopt;
+        BoardGuard g(fb, n->atk.first, n->atk.second, color);
+        if (five_point_cells_fb(fb, n->atk.first, n->atk.second, color).empty()) return nullopt;
+    }
+    return n->atk;
+}
+
 // ================= 7. Negamax =================
 double _score_to_tt(double sc, int ply) {
     if (sc > MATE_MARK) return sc + ply;
@@ -1142,8 +1327,8 @@ pair<double, optional<Pos>> negamax(FastBoard& fb, int color, int depth, double 
     if (killer_it != KILLER.end()) killer = killer_it->second;
 
     auto _sk = [&](const Pos& a, const Pos& b) {
-        double va = quick_eval_fb(fb, a.first, a.second, color) + 0.5 * hget(make_pair(color, a));
-        double vb = quick_eval_fb(fb, b.first, b.second, color) + 0.5 * hget(make_pair(color, b));
+        double va = quick_eval_fb(fb, a.first, a.second, color) + 0.5 * hget(make_pair(color, a)) + 150.0 * _four_quality(fb, a, color);
+        double vb = quick_eval_fb(fb, b.first, b.second, color) + 0.5 * hget(make_pair(color, b)) + 150.0 * _four_quality(fb, b, color);
         if (killer.has_value()) {
             if (a == killer.value()) va += 400.0;
             if (b == killer.value()) vb += 400.0;
@@ -1233,6 +1418,14 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
     unordered_map<uint64_t, TTEntry>& search_tt) {
     int opp = 1 - color;
 
+    // 0.【快速绝杀模式】在已复核的证明树上：零思考落子
+    if (mate_mode_active() && g_mate_color == color) {
+        auto fast = mate_mode_move(fb, color);
+        if (fast.has_value()) return fast.value();
+        mate_mode_reset();
+    }
+
+    // 1. 立即成五  2. 挡对方成五  3. 自己双四
     auto fives = five_moves(fb, color);
     if (!fives.empty()) return _best_by_eval_fb(fb, fives, color);
 
@@ -1253,12 +1446,34 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
         return Deadline(min(get_time() + max(deadline.left() * frac, 0.5), deadline.t));
         };
 
-    try {
-        auto path = search_vcf(fb, color, VCF_DEPTH, sub_deadline(0.4), vcf_tt);
-        if (path.has_value()) return (*path)[0];
+    // ===== 3.5 VCF 完整证明树：唯一有权开启快速绝杀模式的通道 =====
+    {
+        optional<MateNode> mate_tree;
+        double vcf_time = max(deadline.left() * 0.45, 1.0);
+        Deadline vcf_dl(min(get_time() + vcf_time, deadline.t - 0.8));
+        for (int d = 2; d <= VCF_DEPTH; d += 2) {
+            long long budget = 500000;
+            try {
+                auto r = search_vcf_tree(fb, color, d, vcf_dl, budget);
+                if (r.has_value()) { mate_tree = move(r); break; }
+            }
+            catch (const TimeoutException&) { break; }
+            if (vcf_dl.left() < 0.5) break;
+        }
+        if (mate_tree.has_value()) {
+            bool ok = false;
+            try { ok = verify_mate_tree(fb, *mate_tree, color, Deadline(get_time() + 5.0)); }
+            catch (const TimeoutException&) { ok = false; }
+            if (ok) {
+                g_mate_root = move(mate_tree);
+                g_mate_color = color;
+                g_mate_cur = &(*g_mate_root);
+                return g_mate_cur->atk;
+            }
+        }
     }
-    catch (const TimeoutException&) {}
 
+    // 对方双四防守
     auto opp_fours_full = four_moves_full(fb, opp);
     vector<Pos> opp_dbl;
     for (auto& item : opp_fours_full) if (item.second >= 2) opp_dbl.push_back(item.first);
@@ -1272,8 +1487,6 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
         optional<Pos> best_mv;
         double best_v = -1e18;
         for (auto& mv : resp) {
-            // 【修复】先落子判 bad, 撤销后再评估 quick_eval_fb (与 Python 对齐):
-            // quick_eval_fb 语义为"若在空点落子的价值", 落子状态带入会改变线内容与 lkey。
             bool bad;
             {
                 BoardGuard guard(fb, mv.first, mv.second, color);
@@ -1351,8 +1564,9 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
     }
     catch (const TimeoutException&) {}
 
+    // VCT：只用于选出"当前这一手"
     try {
-        auto path = search_vct_id(fb, color, VCT_DEPTH, sub_deadline(0.5), vct_tt);
+        auto path = search_vct_id(fb, color, VCT_DEPTH, sub_deadline(0.35), vct_tt);
         if (path.has_value()) return (*path)[0];
     }
     catch (const TimeoutException&) {}
@@ -1417,7 +1631,14 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
     try {
         vector<tuple<int, Pos, int>> ca;
         auto fours = four_moves_full(fb, color);
-        sort(fours.begin(), fours.end(), [](const pair<Pos, int>& a, const pair<Pos, int>& b) { return a.second > b.second; });
+        // 【跳四修复】双四 > 连冲四 > 跳四 > 估值
+        sort(fours.begin(), fours.end(), [&](const pair<Pos, int>& a, const pair<Pos, int>& b) {
+            if (a.second != b.second) return a.second > b.second;
+            int qa = _four_quality(fb, a.first, color);
+            int qb = _four_quality(fb, b.first, color);
+            if (qa != qb) return qa > qb;
+            return quick_eval_fb(fb, a.first.first, a.first.second, color) > quick_eval_fb(fb, b.first.first, b.first.second, color);
+            });
         int limit = min(8, (int)fours.size());
         for (int i = 0; i < limit; ++i) ca.push_back(make_tuple(0, fours[i].first, fours[i].second));
 
@@ -1516,8 +1737,22 @@ struct AI {
     AI(const vector<vector<int>>& board_2d, int c) : board(board_2d), color(c), opp(1 - c), fb(board_2d) {}
 
     void sync_board(const vector<vector<int>>& board_2d) {
+        Pos opp_move{ -1, -1 };
+        for (int i = 0; i < SIZE; ++i) {
+            for (int j = 0; j < SIZE; ++j) {
+                if (board_2d[i][j] == opp && board[i][j] != opp) {
+                    opp_move = { i, j };
+                }
+            }
+        }
         board = board_2d;
         fb = FastBoard(board_2d);
+        if (opp_move.first != -1) {
+            mate_mode_notify(fb, opp_move);
+        }
+        else {
+            mate_mode_reset();
+        }
     }
 
     optional<Pos> get_move(const vector<vector<int>>& board_2d, int c) {
@@ -1752,7 +1987,6 @@ string _respond(const string& req_json, AI& ai) {
                     }
                 }
             }
-            // 与 Python 一致: 输出最多 2 个 (pts[:2]), 不足时不会越界
             size_t cnt = min((size_t)2, pts.size());
             stringstream ss;
             ss << "{\"action\": \"black5_candidates\", \"points\": [";
@@ -1820,7 +2054,6 @@ bool _all_digits(const string& s) {
     return true;
 }
 
-// 支持 "8H" (1-based 行) 和 "8 7" (0-based 行列), 与 Python 版一致
 Pos get_user_move(const vector<vector<int>>& board, const string& prompt) {
     while (true) {
         cout << prompt;
@@ -1828,7 +2061,6 @@ Pos get_user_move(const vector<vector<int>>& board, const string& prompt) {
         getline(cin, s);
         s = _strip(s);
 
-        // 形如 "8H"
         if (!s.empty() && isalpha((unsigned char)s.back())) {
             string num_part = s.substr(0, s.length() - 1);
             char letter = toupper((unsigned char)s.back());
@@ -1840,7 +2072,6 @@ Pos get_user_move(const vector<vector<int>>& board, const string& prompt) {
                 }
             }
         }
-        // 形如 "8 7"
         {
             istringstream iss(s);
             string a, b;
@@ -1888,10 +2119,8 @@ void run_local_test() {
     board[7][7] = BLACK;
     cout << "黑1 天元 " << normalize_pos(make_pair(7, 7)) << "\n";
 
-    // ---- 白2 / 黑3 选择 ----
     Pos w2, b3;
     if (user_is_black) {
-        // 与 Python 一致, 按 OPENINGS_DB 插入顺序枚举
         for (size_t i = 0; i < OPENINGS_ORDER.size(); ++i) {
             auto it_name = OPENINGS_DB.find(OPENINGS_ORDER[i]);
             string name = (it_name != OPENINGS_DB.end()) ? it_name->second.first : "?";
@@ -1922,7 +2151,6 @@ void run_local_test() {
     board[b3.first][b3.second] = BLACK;
     print_board(board);
 
-    // ---- 交换决策 ----
     bool swap;
     if (user_is_black) {
         auto it_ov = OPENINGS_DB.find(make_pair(w2, b3));
@@ -1944,7 +2172,6 @@ void run_local_test() {
     ai.opp = 1 - ai.color;
     ai.board = board;
 
-    // ---- 白4 ----
     if (user_is_black) {
         auto m = ai.get_move(board, WHITE);
         Pos mv = m.value_or(make_pair(0, 0));
@@ -1957,7 +2184,6 @@ void run_local_test() {
     }
     print_board(board);
 
-    // ---- 黑5候选 / 选择 ----
     Pos chosen;
     if (user_is_black) {
         Pos b5_1 = get_user_move(board, "黑5候选1 (如 8H): ");
@@ -1977,7 +2203,6 @@ void run_local_test() {
     board[chosen.first][chosen.second] = BLACK;
     print_board(board);
 
-    // ---- 正常对局 ----
     int turn = WHITE;
     cout << "=== 进入正常对局 ===\n";
     while (true) {
