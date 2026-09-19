@@ -68,6 +68,7 @@ map<OpeningKey, OpeningVal> OPENINGS_DB = {
     {{{8, 8}, {6, 5}}, {"名月", "WHITE_WIN"}}, {{{8, 8}, {5, 5}}, {"彗星", "WHITE_WIN"}},
 };
 
+// 与 Python OPENINGS_DB 的插入顺序一致，本地测试枚举开局时使用
 static const vector<OpeningKey> OPENINGS_ORDER = {
     {{7, 8}, {7, 9}}, {{7, 8}, {8, 9}}, {{7, 8}, {9, 9}}, {{7, 8}, {8, 8}},
     {{7, 8}, {9, 8}}, {{7, 8}, {8, 7}}, {{7, 8}, {9, 7}}, {{7, 8}, {7, 6}},
@@ -89,7 +90,9 @@ struct Deadline {
     double t;
     Deadline(double t) : t(t) {}
     double left() const { return t - get_time(); }
-    void check() const { if (get_time() > t) throw TimeoutException(); }
+    void check() const {
+        if (get_time() > t) throw TimeoutException();
+    }
 };
 
 void log_debug(const string& msg) {
@@ -166,7 +169,7 @@ void init_globals() {
     }
 }
 
-// ================= 2. FastBoard =================
+// ================= 2. 预计算线表 & 棋盘 =================
 struct FastBoard {
     int board[SIZE][SIZE];
     vector<string> line_strings;
@@ -272,7 +275,9 @@ struct BoardGuard {
     BoardGuard(FastBoard& b, int x, int y, int c) : fb(b), x(x), y(y), color(c) {
         fb.place(x, y, color);
     }
-    ~BoardGuard() { fb.undo(x, y, color); }
+    ~BoardGuard() {
+        fb.undo(x, y, color);
+    }
 };
 
 // ================= 3. 棋型分析 =================
@@ -311,41 +316,23 @@ pair<set<int>, set<vector<int>>> _five_points_and_shapes(const string& s, int ci
     return make_pair(pts, shapes);
 }
 
-bool _is_live_three(const string& s, int ci, int color) {
+bool _is_live_three(const string& s, int ci) {
     int n = (int)s.length();
     auto ij = _run_at(s, ci);
     int i = ij.first, j = ij.second;
-
     if (j - i + 1 == 3) {
         if (i > 0 && j + 1 < n && s[i - 1] == B0 && s[j + 1] == B0) {
-            if (color != BLACK) {
-                if ((i > 1 && s[i - 2] == B0) || (j + 2 < n && s[j + 2] == B0)) return true;
-            }
-            else {
-                bool left_ok = (i > 1 && s[i - 2] == B0)
-                    && (i - 3 < 0 || s[i - 3] != B1)
-                    && (j + 2 >= n || s[j + 2] != B1);
-                bool right_ok = (j + 2 < n && s[j + 2] == B0)
-                    && (j + 3 >= n || s[j + 3] != B1)
-                    && (i - 2 < 0 || s[i - 2] != B1);
-                if (left_ok || right_ok) return true;
-            }
+            if ((i > 1 && s[i - 2] == B0) || (j + 2 < n && s[j + 2] == B0)) return true;
         }
     }
-
-    static const char* pats[2] = { "010110", "011010" };
-    for (int pi = 0; pi < 2; ++pi) {
-        const string pat = pats[pi];
-        size_t k = 0;
-        while ((k = s.find(pat, k)) != string::npos) {
-            int K = (int)k;
-            if (K <= ci && ci < K + 6) {
-                bool upper_ok = (K == 0) || (s[K - 1] != B1);
-                bool lower_ok = (K + 6 >= n) || (s[K + 6] != B1);
-                if (color != BLACK) return true;
-                if (upper_ok && lower_ok) return true;
-            }
-            ++k;
+    vector<string> pats = { "010110", "011010" };
+    for (const string& pat : pats) {
+        size_t st = 0;
+        while (true) {
+            size_t k = s.find(pat, st);
+            if (k == string::npos) break;
+            if ((int)k <= ci && ci < (int)k + 6) return true;
+            st = k + 1;
         }
     }
     return false;
@@ -373,13 +360,13 @@ tuple<bool, bool, int, int, int> analyze_move_fb(FastBoard& fb, int x, int y, in
         auto& shapes = pts_shapes.second;
         fp_total += (int)pts.size();
         fs_total += (int)shapes.size();
-        if (_is_live_three(s, ci, color)) lt_total += 1;
+        if (_is_live_three(s, ci)) lt_total += 1;
     }
     bool foul = (color == BLACK) && (!win) && (overline || fs_total >= 2 || lt_total >= 2);
     return make_tuple(win, foul, fp_total, fs_total, lt_total);
 }
 
-// ================= 3.5 缓存 =================
+// ================= 3.5 线内容级缓存 =================
 struct AnKey {
     int color;
     uint64_t k1, k2, k3, k4;
@@ -646,7 +633,10 @@ vector<Pos> five_moves(FastBoard& fb, int color) {
     for (int lid = 0; lid < NUM_GLOBAL_LINES; ++lid) {
         if (fb.lcnt[lid] < 4) continue;
         auto scan_result = _line_scan_k(fb, lid);
-        const vector<int>* idxs_ptr = (k == 0) ? &get<0>(scan_result) : &get<3>(scan_result);
+        const vector<int>* idxs_ptr = nullptr;
+        if (k == 0) idxs_ptr = &get<0>(scan_result);
+        else idxs_ptr = &get<3>(scan_result);
+
         for (int e : *idxs_ptr) {
             seen.insert(GLOBAL_LINES[lid][e]);
         }
@@ -660,7 +650,9 @@ vector<pair<Pos, int>> four_moves_full(FastBoard& fb, int color) {
     for (int lid = 0; lid < NUM_GLOBAL_LINES; ++lid) {
         if (fb.lcnt[lid] < 3) continue;
         auto scan_result = _line_scan_k(fb, lid);
-        const vector<int>* idxs_ptr = (k == 1) ? &get<1>(scan_result) : &get<4>(scan_result);
+        const vector<int>* idxs_ptr = nullptr;
+        if (k == 1) idxs_ptr = &get<1>(scan_result);
+        else idxs_ptr = &get<4>(scan_result);
         for (int e : *idxs_ptr) {
             seen.insert(GLOBAL_LINES[lid][e]);
         }
@@ -670,9 +662,7 @@ vector<pair<Pos, int>> four_moves_full(FastBoard& fb, int color) {
         BoardGuard guard(fb, p.first, p.second, color);
         auto res = analyze_move_k(fb, p.first, p.second, color);
         if (!get<0>(res) && !get<1>(res) && get<2>(res) >= 1) {
-            // 【核心修复】抑制无意义的跳四：双成点(活四/连四)给高分100，单成点(跳四/边线冲四)给低分10
-            int score = (get<2>(res) >= 2) ? 100 : 10;
-            out.push_back(make_pair(p, score));
+            out.push_back(make_pair(p, get<2>(res)));
         }
     }
     return out;
@@ -690,7 +680,9 @@ vector<Pos> three_moves(FastBoard& fb, int color) {
     for (int lid = 0; lid < NUM_GLOBAL_LINES; ++lid) {
         if (fb.lcnt[lid] < 2) continue;
         auto scan_result = _line_scan_k(fb, lid);
-        const vector<int>* idxs_ptr = (k == 2) ? &get<2>(scan_result) : &get<5>(scan_result);
+        const vector<int>* idxs_ptr = nullptr;
+        if (k == 2) idxs_ptr = &get<2>(scan_result);
+        else idxs_ptr = &get<5>(scan_result);
         for (int e : *idxs_ptr) {
             seen.insert(GLOBAL_LINES[lid][e]);
         }
@@ -726,7 +718,8 @@ double _attack_val(FastBoard& fb, int x, int y, int color) {
     double v = 0.0;
     for (auto& p : CELL_LINES[x][y]) {
         auto scores = _center_scores_k(fb, p.first, p.second);
-        v += (color == BLACK) ? scores.first : scores.second;
+        double bv = scores.first, wv = scores.second;
+        v += (color == BLACK) ? bv : wv;
     }
     return v;
 }
@@ -772,7 +765,10 @@ optional<Pos> _best_by_eval_fb(FastBoard& fb, const vector<Pos>& moves, int colo
     double max_v = quick_eval_fb(fb, moves[0].first, moves[0].second, color);
     for (size_t i = 1; i < moves.size(); ++i) {
         double v = quick_eval_fb(fb, moves[i].first, moves[i].second, color);
-        if (v > max_v) { max_v = v; best = moves[i]; }
+        if (v > max_v) {
+            max_v = v;
+            best = moves[i];
+        }
     }
     return best;
 }
@@ -795,7 +791,10 @@ optional<Pos> fallback_move_fb(FastBoard& fb, int color) {
     double max_v = quick_eval_fb(fb, pool[0].first, pool[0].second, color);
     for (size_t i = 1; i < pool.size(); ++i) {
         double v = quick_eval_fb(fb, pool[i].first, pool[i].second, color);
-        if (v > max_v) { max_v = v; best = pool[i]; }
+        if (v > max_v) {
+            max_v = v;
+            best = pool[i];
+        }
     }
     return best;
 }
@@ -819,7 +818,7 @@ vector<Pos> top_moves_fb(FastBoard& fb, int color, int n) {
     return pool;
 }
 
-// ================= 6. TT =================
+// ================= 6. VCF/VCT 证明树 =================
 struct TTEntry {
     int depth;
     int flag;
@@ -835,8 +834,7 @@ void _tt_store(unordered_map<uint64_t, TTEntry>& tt, uint64_t key, int depth, do
 
 void _tt_store_fail(unordered_map<uint64_t, TTEntry>& tt, uint64_t key, int depth) {
     auto it = tt.find(key);
-    if (it != tt.end() && it->second.mv.has_value()) return;
-    if (it != tt.end() && it->second.depth >= depth) return;
+    if (it != tt.end() && !it->second.mv.has_value() && it->second.depth >= depth) return;
     if ((int)tt.size() > TT_CAP) tt.clear();
     tt[key] = { depth, 2, 0, nullopt };
 }
@@ -844,12 +842,8 @@ void _tt_store_fail(unordered_map<uint64_t, TTEntry>& tt, uint64_t key, int dept
 pair<bool, optional<TTEntry>> _tt_get(const unordered_map<uint64_t, TTEntry>& tt, uint64_t key, int depth) {
     auto it = tt.find(key);
     if (it == tt.end()) return make_pair(false, nullopt);
-    // 【核心修复】防止伪证：只有当缓存的深度 >= 请求的深度时，结果才可信
-    // 原代码中 mv.has_value() 时使用了 depth >= it->second.depth，这会导致深层搜索错误地复用浅层的“胜”缓存
-    if (it->second.depth >= depth) {
-        return make_pair(true, it->second);
-    }
-    return make_pair(false, nullopt);
+    if (it->second.mv.has_value()) return make_pair(depth >= it->second.depth, it->second);
+    return make_pair(depth <= it->second.depth, it->second);
 }
 
 vector<pair<Pos, int>> _threat_moves_scored(FastBoard& fb, int color) {
@@ -892,150 +886,68 @@ vector<Pos> _defense_candidates(FastBoard& fb, int color, const set<Pos>& block_
     return res;
 }
 
-// ================= 6.5 VCF =================
-optional<vector<Pos>> search_vcf(FastBoard& fb, int color, int depth,
-    const Deadline& deadline,
-    unordered_map<uint64_t, TTEntry>& tt) {
+optional<vector<Pos>> search_vcf(FastBoard& fb, int color, int depth, const Deadline& deadline, unordered_map<uint64_t, TTEntry>& tt);
+optional<vector<Pos>> search_vct(FastBoard& fb, int color, int depth, const Deadline& deadline, unordered_map<uint64_t, TTEntry>& tt, set<pair<uint64_t, int>>* path_ptr);
+
+optional<vector<Pos>> search_vcf(FastBoard& fb, int color, int depth, const Deadline& deadline, unordered_map<uint64_t, TTEntry>& tt) {
     deadline.check();
     uint64_t key = fb.hash ^ ((uint64_t)color << 50) ^ 0x12345678ULL;
     auto tt_result = _tt_get(tt, key, depth);
-    if (tt_result.first && tt_result.second.has_value() && tt_result.second->mv.has_value()) {
-        return vector<Pos>{ tt_result.second->mv.value() };
+    bool hit = tt_result.first;
+    optional<TTEntry> ent = tt_result.second;
+    if (hit && ent.has_value() && ent->mv.has_value()) {
+        return vector<Pos>{ent->mv.value()};
     }
 
     auto fives = five_moves(fb, color);
     if (!fives.empty()) {
         _tt_store(tt, key, depth, 0, fives[0], 0);
-        return vector<Pos>{ fives[0] };
+        return vector<Pos>{fives[0]};
     }
     if (depth <= 0) {
         _tt_store_fail(tt, key, depth);
         return nullopt;
     }
-
     int opp = 1 - color;
     auto fours = four_moves_full(fb, color);
-    sort(fours.begin(), fours.end(),
-        [](const pair<Pos, int>& a, const pair<Pos, int>& b) {
-            return a.second > b.second;
-        });
-
-    optional<vector<Pos>> best_path;
-    size_t best_len = SIZE_MAX;
+    sort(fours.begin(), fours.end(), [](const pair<Pos, int>& a, const pair<Pos, int>& b) { return a.second > b.second; });
 
     for (auto& item : fours) {
         Pos atk = item.first;
         deadline.check();
         BoardGuard guard(fb, atk.first, atk.second, color);
-
         if (!five_moves(fb, opp).empty()) continue;
-
         auto defs = five_point_cells_fb(fb, atk.first, atk.second, color);
         if (defs.empty()) continue;
-
         bool all_win = true;
-        optional<vector<Pos>> best_sub;
-        size_t best_sub_len = SIZE_MAX;
-
         for (auto& df : defs) {
             deadline.check();
             BoardGuard guard2(fb, df.first, df.second, opp);
-
-            if (is_win_at_fb(fb, df.first, df.second, opp)) {
+            optional<vector<Pos>> sub;
+            if (opp == BLACK) {
+                auto res = analyze_move_k(fb, df.first, df.second, opp);
+                if (get<0>(res)) sub = nullopt;
+                else if (get<1>(res)) sub = vector<Pos>{ df };
+                else sub = search_vcf(fb, color, depth - 1, deadline, tt);
+            }
+            else {
+                sub = search_vcf(fb, color, depth - 1, deadline, tt);
+            }
+            if (!sub.has_value()) {
                 all_win = false;
                 break;
             }
-
-            if (opp == BLACK) {
-                auto res = analyze_move_k(fb, df.first, df.second, opp);
-                if (get<0>(res)) { all_win = false; break; }
-                if (get<1>(res)) continue;
-            }
-
-            auto sub = search_vcf(fb, color, depth - 1, deadline, tt);
-            if (!sub.has_value()) { all_win = false; break; }
-            if (sub->size() < best_sub_len) {
-                best_sub = sub;
-                best_sub_len = sub->size();
-            }
         }
-
         if (all_win) {
-            vector<Pos> full{ atk };
-            if (best_sub.has_value()) {
-                full.insert(full.end(), best_sub->begin(), best_sub->end());
-            }
-            if (full.size() < best_len) {
-                best_len = full.size();
-                best_path = full;
-            }
-            if (best_len <= 2) break;
+            _tt_store(tt, key, depth, 0, atk, 0);
+            return vector<Pos>{atk};
         }
-    }
-
-    if (best_path.has_value()) {
-        _tt_store(tt, key, depth, 0, (*best_path)[0], 0);
-        return best_path;
     }
     _tt_store_fail(tt, key, depth);
     return nullopt;
 }
 
-optional<vector<Pos>> search_vcf_id(FastBoard& fb, int color, int max_depth,
-    const Deadline& deadline,
-    unordered_map<uint64_t, TTEntry>& tt) {
-    optional<vector<Pos>> best_r;
-    for (int d = 2; d <= max_depth; d += 2) {
-        deadline.check();
-        if (deadline.left() < 1.0 && best_r.has_value()) break;
-
-        try {
-            auto r = search_vcf(fb, color, d, deadline, tt);
-            if (r.has_value()) {
-                best_r = r;
-            }
-            else {
-                // 【核心修复】如果更深的搜索完整执行后没有找到路径，说明之前浅层找到的路径是伪证！
-                if (best_r.has_value()) {
-                    best_r = nullopt;
-                }
-            }
-        }
-        catch (const TimeoutException&) {
-            break;
-        }
-    }
-    return best_r;
-}
-
-// ================= 6.6 VCT 防守枚举 =================
-static vector<Pos> _vct_defense_moves(FastBoard& fb, int attacker, int defender) {
-    set<Pos> defs;
-
-    for (auto& p : five_moves(fb, attacker)) defs.insert(p);
-    for (auto& item : four_moves_full(fb, attacker)) defs.insert(item.first);
-    for (auto& item : four_moves_full(fb, defender)) defs.insert(item.first);
-    for (auto& p : three_moves(fb, defender)) defs.insert(p);
-    if (attacker == BLACK) {
-        auto traps = _foul_trap_points(fb);
-        for (auto& p : traps) defs.insert(p);
-    }
-
-    vector<Pos> legal;
-    legal.reserve(defs.size());
-    for (auto& p : defs) {
-        if (fb.board[p.first][p.second] != EMPTY) continue;
-        if (defender == BLACK && is_ban_move_fb(fb, p.first, p.second)) continue;
-        legal.push_back(p);
-    }
-    return legal;
-}
-
-// ================= 6.7 VCT =================
-optional<vector<Pos>> search_vct(FastBoard& fb, int color, int depth,
-    const Deadline& deadline,
-    unordered_map<uint64_t, TTEntry>& tt,
-    set<pair<uint64_t, int>>* path_ptr = nullptr) {
+optional<vector<Pos>> search_vct(FastBoard& fb, int color, int depth, const Deadline& deadline, unordered_map<uint64_t, TTEntry>& tt, set<pair<uint64_t, int>>* path_ptr = nullptr) {
     deadline.check();
     set<pair<uint64_t, int>> local_path;
     set<pair<uint64_t, int>>& path = path_ptr ? *path_ptr : local_path;
@@ -1044,151 +956,119 @@ optional<vector<Pos>> search_vct(FastBoard& fb, int color, int depth,
 
     uint64_t key = key_h ^ 0x87654321ULL;
     auto tt_result = _tt_get(tt, key, depth);
-    if (tt_result.first && tt_result.second.has_value() && tt_result.second->mv.has_value()) {
-        return vector<Pos>{ tt_result.second->mv.value() };
+    bool hit = tt_result.first;
+    optional<TTEntry> ent = tt_result.second;
+    if (hit && ent.has_value() && ent->mv.has_value()) {
+        return vector<Pos>{ent->mv.value()};
     }
 
     auto fives = five_moves(fb, color);
     if (!fives.empty()) {
         _tt_store(tt, key, depth, 0, fives[0], 0);
-        return vector<Pos>{ fives[0] };
+        return vector<Pos>{fives[0]};
     }
     if (depth <= 0) {
         _tt_store_fail(tt, key, depth);
         return nullopt;
     }
-
     int opp = 1 - color;
 
     auto fours_sorted = four_moves_full(fb, color);
-    sort(fours_sorted.begin(), fours_sorted.end(),
-        [](const pair<Pos, int>& a, const pair<Pos, int>& b) {
-            return a.second > b.second;
-        });
-
+    sort(fours_sorted.begin(), fours_sorted.end(), [](const pair<Pos, int>& a, const pair<Pos, int>& b) { return a.second > b.second; });
     vector<Pos> atks;
     set<Pos> seen_atk;
     for (auto& item : fours_sorted) {
-        if (seen_atk.insert(item.first).second) atks.push_back(item.first);
+        seen_atk.insert(item.first);
+        atks.push_back(item.first);
     }
     for (auto& p : _threat_moves(fb, color)) {
-        if (seen_atk.insert(p).second) atks.push_back(p);
+        if (seen_atk.find(p) == seen_atk.end()) {
+            seen_atk.insert(p);
+            atks.push_back(p);
+        }
     }
     if (atks.empty()) {
         _tt_store_fail(tt, key, depth);
         return nullopt;
     }
 
-    path.insert(make_pair(key_h, color));
-    optional<vector<Pos>> best_path;
-    size_t best_len = SIZE_MAX;
+    set<Pos> opp_fours_pre;
+    for (auto& p : four_moves(fb, opp)) opp_fours_pre.insert(p);
 
+    path.insert(make_pair(key_h, color));
+    optional<vector<Pos>> result = nullopt;
     try {
         for (auto& atk : atks) {
             deadline.check();
             BoardGuard guard(fb, atk.first, atk.second, color);
-
             if (!five_moves(fb, opp).empty()) continue;
-
-            vector<Pos> legal_defs = _vct_defense_moves(fb, color, opp);
-
-            if (legal_defs.empty()) {
-                vector<Pos> full{ atk };
-                if (full.size() < best_len) {
-                    best_len = full.size();
-                    best_path = full;
-                }
-                continue;
+            auto res = analyze_move_k(fb, atk.first, atk.second, color);
+            set<Pos> defs;
+            if (get<2>(res) >= 1) {
+                auto fives = five_point_cells_fb(fb, atk.first, atk.second, color);
+                defs.insert(fives.begin(), fives.end());
             }
-
+            else {
+                auto vic = _line_vicinity_fb(fb, atk.first, atk.second);
+                defs.insert(vic.begin(), vic.end());
+            }
+            for (auto& p : opp_fours_pre) {
+                if (!(p == atk)) defs.insert(p);
+            }
+            if (defs.empty()) continue;
             bool all_win = true;
-            optional<vector<Pos>> best_sub;
-            size_t best_sub_len = SIZE_MAX;
-
-            for (auto& df : legal_defs) {
+            for (auto& df : defs) {
                 deadline.check();
                 BoardGuard guard2(fb, df.first, df.second, opp);
-
-                if (is_win_at_fb(fb, df.first, df.second, opp)) {
+                optional<vector<Pos>> sub;
+                if (opp == BLACK) {
+                    auto res_d = analyze_move_k(fb, df.first, df.second, opp);
+                    if (get<0>(res_d)) sub = nullopt;
+                    else if (get<1>(res_d)) sub = vector<Pos>{ df };
+                    else sub = search_vct(fb, color, depth - 1, deadline, tt, &path);
+                }
+                else {
+                    sub = search_vct(fb, color, depth - 1, deadline, tt, &path);
+                }
+                if (!sub.has_value()) {
                     all_win = false;
                     break;
                 }
-
-                if (opp == BLACK) {
-                    auto res_d = analyze_move_k(fb, df.first, df.second, opp);
-                    if (get<0>(res_d)) { all_win = false; break; }
-                    if (get<1>(res_d)) continue;
-                }
-
-                auto sub = search_vct(fb, color, depth - 1, deadline, tt, &path);
-                if (!sub.has_value()) { all_win = false; break; }
-                if (sub->size() < best_sub_len) {
-                    best_sub = sub;
-                    best_sub_len = sub->size();
-                }
             }
-
             if (all_win) {
-                vector<Pos> full{ atk };
-                if (best_sub.has_value()) {
-                    full.insert(full.end(), best_sub->begin(), best_sub->end());
-                }
-                if (full.size() < best_len) {
-                    best_len = full.size();
-                    best_path = full;
-                }
-                if (best_len <= 2) break;
+                _tt_store(tt, key, depth, 0, atk, 0);
+                result = vector<Pos>{ atk };
+                break;
             }
         }
-
-        if (best_path.has_value()) {
-            _tt_store(tt, key, depth, 0, (*best_path)[0], 0);
-        }
-        else {
-            _tt_store_fail(tt, key, depth);
-        }
+        if (!result.has_value()) _tt_store_fail(tt, key, depth);
     }
     catch (...) {
         path.erase(make_pair(key_h, color));
         throw;
     }
     path.erase(make_pair(key_h, color));
-    return best_path;
+    return result;
 }
 
-optional<vector<Pos>> search_vct_id(FastBoard& fb, int color, int max_depth,
-    const Deadline& deadline,
-    unordered_map<uint64_t, TTEntry>& tt) {
-    optional<vector<Pos>> best_r;
+optional<vector<Pos>> search_vct_id(FastBoard& fb, int color, int max_depth, const Deadline& deadline, unordered_map<uint64_t, TTEntry>& tt) {
     for (int d = VCT_ID_START; d <= max_depth; d += VCT_ID_STEP) {
         deadline.check();
-        if (deadline.left() < 1.0 && best_r.has_value()) break;
-
-        try {
-            auto r = search_vct(fb, color, d, deadline, tt);
-            if (r.has_value()) {
-                best_r = r;
-            }
-            else {
-                // 【核心修复】如果更深的搜索完整执行后没有找到路径，说明之前浅层找到的路径是伪证！
-                if (best_r.has_value()) {
-                    best_r = nullopt;
-                }
-            }
-        }
-        catch (const TimeoutException&) {
-            break;
-        }
+        auto r = search_vct(fb, color, d, deadline, tt);
+        if (r.has_value()) return r;
+        if (deadline.left() < 1.5) return nullopt;
     }
-    return best_r;
+    return nullopt;
 }
 
 bool vcf_disproved(FastBoard& fb, int color, int max_depth, const Deadline& deadline, unordered_map<uint64_t, TTEntry>& tt) {
     try {
-        auto r = search_vcf(fb, color, max_depth, deadline, tt);
-        return !r.has_value();
+        auto result = search_vcf(fb, color, max_depth, deadline, tt);
+        return !result.has_value();
     }
-    catch (const TimeoutException&) { return false; }
+    catch (const TimeoutException&) {
+        return false;
+    }
 }
 
 bool vct_disproved(FastBoard& fb, int color, int max_depth, const Deadline& deadline, unordered_map<uint64_t, TTEntry>& tt) {
@@ -1199,7 +1079,9 @@ bool vct_disproved(FastBoard& fb, int color, int max_depth, const Deadline& dead
         }
         return true;
     }
-    catch (const TimeoutException&) { return false; }
+    catch (const TimeoutException&) {
+        return false;
+    }
 }
 
 // ================= 7. Negamax =================
@@ -1223,9 +1105,7 @@ struct PairHash {
 unordered_map<pair<int, Pos>, int, PairHash> HIST;
 unordered_map<int, Pos> KILLER;
 
-pair<double, optional<Pos>> negamax(FastBoard& fb, int color, int depth, double alpha, double beta,
-    const Deadline& deadline, int ply,
-    unordered_map<uint64_t, TTEntry>& tt) {
+pair<double, optional<Pos>> negamax(FastBoard& fb, int color, int depth, double alpha, double beta, const Deadline& deadline, int ply, unordered_map<uint64_t, TTEntry>& tt) {
     deadline.check();
     uint64_t key = fb.hash ^ ((uint64_t)color << 50);
     optional<TTEntry> ent_opt = nullopt;
@@ -1313,7 +1193,10 @@ pair<double, optional<Pos>> negamax(FastBoard& fb, int color, int depth, double 
             auto sub = negamax(fb, 1 - color, nd, -beta, -alpha, deadline, ply + 1, tt);
             sc = -sub.first;
         }
-        if (sc > best) { best = sc; best_mv = mv; }
+        if (sc > best) {
+            best = sc;
+            best_mv = mv;
+        }
         if (sc > alpha) alpha = sc;
         if (alpha >= beta) {
             pair<int, Pos> hk = make_pair(color, mv);
@@ -1370,23 +1253,11 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
         return Deadline(min(get_time() + max(deadline.left() * frac, 0.5), deadline.t));
         };
 
-    optional<vector<Pos>> vcf_path, vct_path;
-
     try {
-        vcf_path = search_vcf_id(fb, color, VCF_DEPTH, sub_deadline(0.3), vcf_tt);
+        auto path = search_vcf(fb, color, VCF_DEPTH, sub_deadline(0.4), vcf_tt);
+        if (path.has_value()) return (*path)[0];
     }
     catch (const TimeoutException&) {}
-
-    try {
-        vct_path = search_vct_id(fb, color, VCT_DEPTH, sub_deadline(0.3), vct_tt);
-    }
-    catch (const TimeoutException&) {}
-
-    if (vcf_path.has_value() && vct_path.has_value()) {
-        return (vcf_path->size() <= vct_path->size()) ? (*vcf_path)[0] : (*vct_path)[0];
-    }
-    if (vcf_path.has_value()) return (*vcf_path)[0];
-    if (vct_path.has_value()) return (*vct_path)[0];
 
     auto opp_fours_full = four_moves_full(fb, opp);
     vector<Pos> opp_dbl;
@@ -1401,6 +1272,8 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
         optional<Pos> best_mv;
         double best_v = -1e18;
         for (auto& mv : resp) {
+            // 【修复】先落子判 bad, 撤销后再评估 quick_eval_fb (与 Python 对齐):
+            // quick_eval_fb 语义为"若在空点落子的价值", 落子状态带入会改变线内容与 lkey。
             bool bad;
             {
                 BoardGuard guard(fb, mv.first, mv.second, color);
@@ -1442,16 +1315,15 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
     }
 
     try {
-        auto opp_vcf = search_vcf_id(fb, opp, VCF_DEPTH, sub_deadline(0.3), vcf_tt);
-        if (opp_vcf.has_value()) {
-            Pos m = (*opp_vcf)[0];
+        auto path = search_vcf(fb, opp, VCF_DEPTH, sub_deadline(0.3), vcf_tt);
+        if (path.has_value()) {
+            Pos m = (*path)[0];
             set<Pos> cand6;
-            {
-                BoardGuard guard(fb, m.first, m.second, opp);
-                auto defs = five_point_cells_fb(fb, m.first, m.second, opp);
-                auto def_cands = _defense_candidates(fb, color, defs);
-                for (auto& p : def_cands) cand6.insert(p);
-            }
+            BoardGuard guard(fb, m.first, m.second, opp);
+            auto defs = five_point_cells_fb(fb, m.first, m.second, opp);
+            auto def_cands = _defense_candidates(fb, color, defs);
+            for (auto& p : def_cands) cand6.insert(p);
+
             auto top5 = top_moves_fb(fb, color, 5);
             for (auto& p : top5) cand6.insert(p);
 
@@ -1466,7 +1338,7 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
                 });
             if ((int)defs6.size() > 12) defs6.resize(12);
 
-            double v_end = get_time() + deadline.left() * 0.4;
+            double v_end = get_time() + deadline.left() * 0.5;
             for (auto& mv : defs6) {
                 if (get_time() >= v_end || deadline.left() < 1.5) break;
                 BoardGuard guard2(fb, mv.first, mv.second, color);
@@ -1479,13 +1351,19 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
     }
     catch (const TimeoutException&) {}
 
+    try {
+        auto path = search_vct_id(fb, color, VCT_DEPTH, sub_deadline(0.5), vct_tt);
+        if (path.has_value()) return (*path)[0];
+    }
+    catch (const TimeoutException&) {}
+
     set<Pos> cand8;
     vector<Pos> defs8, ok8;
     try {
-        auto opp_vct = search_vct_id(fb, opp, VCT_DEPTH, sub_deadline(0.4), vct_tt);
-        if (opp_vct.has_value()) {
+        auto path = search_vct_id(fb, opp, VCT_DEPTH, sub_deadline(0.4), vct_tt);
+        if (path.has_value()) {
             vector<Pos> opp_starts;
-            opp_starts.push_back((*opp_vct)[0]);
+            opp_starts.push_back((*path)[0]);
             auto top6 = top_moves_fb(fb, opp, 6);
             for (auto& p : top6) {
                 if (find(opp_starts.begin(), opp_starts.end(), p) == opp_starts.end()) {
@@ -1536,21 +1414,12 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
     }
     catch (const TimeoutException&) {}
 
-    // 8. 走威胁着法（自检一遍，确保后续真能连杀）
     try {
         vector<tuple<int, Pos, int>> ca;
         auto fours = four_moves_full(fb, color);
         sort(fours.begin(), fours.end(), [](const pair<Pos, int>& a, const pair<Pos, int>& b) { return a.second > b.second; });
         int limit = min(8, (int)fours.size());
-        for (int i = 0; i < limit; ++i) {
-            // 【核心修复】降低纯跳四（单成点）的优先级，防止AI盲目下跳四
-            if (fours[i].second < 50) {
-                ca.push_back(make_tuple(3, fours[i].first, fours[i].second));
-            }
-            else {
-                ca.push_back(make_tuple(0, fours[i].first, fours[i].second));
-            }
-        }
+        for (int i = 0; i < limit; ++i) ca.push_back(make_tuple(0, fours[i].first, fours[i].second));
 
         auto threats = _threat_moves_scored(fb, color);
         for (auto& item : threats) {
@@ -1586,16 +1455,7 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
 
             double dl_abs = min(get_time() + max(0.3, (v_end2 - get_time()) * 0.3), v_end2);
             Deadline dl(dl_abs);
-            if (vct_disproved(fb, opp, VCT_DEPTH, dl, vct_tt)) {
-                Deadline dl_self(get_time() + max(0.3, deadline.left() * 0.15));
-                bool self_has_vcf = search_vcf(fb, color, VCF_DEPTH, dl_self, vcf_tt).has_value();
-                if (!self_has_vcf) {
-                    Deadline dl_self2(get_time() + max(0.3, deadline.left() * 0.15));
-                    self_has_vcf = search_vct_id(fb, color, 12, dl_self2, vct_tt).has_value();
-                }
-                if (self_has_vcf) return mv;
-                continue;
-            }
+            if (vct_disproved(fb, opp, VCT_DEPTH, dl, vct_tt)) return mv;
 
             if (fp == 1) {
                 auto qs = five_point_cells_fb(fb, mv.first, mv.second, color);
@@ -1605,8 +1465,7 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
                     BoardGuard guard2(fb, q.first, q.second, opp);
                     double dl2_abs = min(get_time() + max(0.3, (v_end2 - get_time()) * 0.2), v_end2);
                     Deadline dl2(dl2_abs);
-                    if (!search_vcf(fb, color, VCF_DEPTH, dl2, vcf_tt).has_value()
-                        && !search_vct_id(fb, color, 12, dl2, vct_tt).has_value()) {
+                    if (!search_vcf(fb, color, VCF_DEPTH, dl2, vcf_tt).has_value() && !search_vct_id(fb, color, 12, dl2, vct_tt).has_value()) {
                         race_win = false;
                     }
                 }
@@ -1626,7 +1485,6 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
     }
     catch (const TimeoutException&) {}
 
-    // 9. Negamax
     optional<Pos> best_mv;
     for (int d : ID_DEPTHS) {
         if (deadline.left() < 1.5) break;
@@ -1634,7 +1492,9 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
             auto res = negamax(fb, color, d, -1e9, 1e9, deadline, 0, search_tt);
             if (res.second.has_value()) best_mv = res.second;
         }
-        catch (const TimeoutException&) { break; }
+        catch (const TimeoutException&) {
+            break;
+        }
     }
     if (best_mv.has_value()) return best_mv;
     return fallback_move_fb(fb, color);
@@ -1713,7 +1573,7 @@ optional<Pos> fallback_move(const vector<vector<int>>& board_2d, int color) {
     return fallback_move_fb(fb, color);
 }
 
-// ================= 10. 框架交互 =================
+// ================= 10. 框架交互逻辑 =================
 string get_last_request(const string& json) {
     size_t pos = json.find("\"requests\"");
     if (pos != string::npos) {
@@ -1892,6 +1752,7 @@ string _respond(const string& req_json, AI& ai) {
                     }
                 }
             }
+            // 与 Python 一致: 输出最多 2 个 (pts[:2]), 不足时不会越界
             size_t cnt = min((size_t)2, pts.size());
             stringstream ss;
             ss << "{\"action\": \"black5_candidates\", \"points\": [";
@@ -1925,7 +1786,7 @@ string _respond(const string& req_json, AI& ai) {
     return "{\"action\": \"pass\"}";
 }
 
-// ================= 11. 本地测试与 main =================
+// ================= 11. 本地测试与主函数 =================
 string normalize_pos(Pos pos) {
     return to_string(pos.first + 1) + (char)(pos.second + 'A');
 }
@@ -1959,12 +1820,15 @@ bool _all_digits(const string& s) {
     return true;
 }
 
+// 支持 "8H" (1-based 行) 和 "8 7" (0-based 行列), 与 Python 版一致
 Pos get_user_move(const vector<vector<int>>& board, const string& prompt) {
     while (true) {
         cout << prompt;
         string s;
         getline(cin, s);
         s = _strip(s);
+
+        // 形如 "8H"
         if (!s.empty() && isalpha((unsigned char)s.back())) {
             string num_part = s.substr(0, s.length() - 1);
             char letter = toupper((unsigned char)s.back());
@@ -1976,6 +1840,7 @@ Pos get_user_move(const vector<vector<int>>& board, const string& prompt) {
                 }
             }
         }
+        // 形如 "8 7"
         {
             istringstream iss(s);
             string a, b;
@@ -2023,8 +1888,10 @@ void run_local_test() {
     board[7][7] = BLACK;
     cout << "黑1 天元 " << normalize_pos(make_pair(7, 7)) << "\n";
 
+    // ---- 白2 / 黑3 选择 ----
     Pos w2, b3;
     if (user_is_black) {
+        // 与 Python 一致, 按 OPENINGS_DB 插入顺序枚举
         for (size_t i = 0; i < OPENINGS_ORDER.size(); ++i) {
             auto it_name = OPENINGS_DB.find(OPENINGS_ORDER[i]);
             string name = (it_name != OPENINGS_DB.end()) ? it_name->second.first : "?";
@@ -2055,6 +1922,7 @@ void run_local_test() {
     board[b3.first][b3.second] = BLACK;
     print_board(board);
 
+    // ---- 交换决策 ----
     bool swap;
     if (user_is_black) {
         auto it_ov = OPENINGS_DB.find(make_pair(w2, b3));
@@ -2076,6 +1944,7 @@ void run_local_test() {
     ai.opp = 1 - ai.color;
     ai.board = board;
 
+    // ---- 白4 ----
     if (user_is_black) {
         auto m = ai.get_move(board, WHITE);
         Pos mv = m.value_or(make_pair(0, 0));
@@ -2088,6 +1957,7 @@ void run_local_test() {
     }
     print_board(board);
 
+    // ---- 黑5候选 / 选择 ----
     Pos chosen;
     if (user_is_black) {
         Pos b5_1 = get_user_move(board, "黑5候选1 (如 8H): ");
@@ -2107,6 +1977,7 @@ void run_local_test() {
     board[chosen.first][chosen.second] = BLACK;
     print_board(board);
 
+    // ---- 正常对局 ----
     int turn = WHITE;
     cout << "=== 进入正常对局 ===\n";
     while (true) {
@@ -2191,7 +2062,9 @@ int main() {
                         c = ai->color;
                     }
                 }
-                else c = 0;
+                else {
+                    c = 0;
+                }
             }
             int color = (c == 0) ? BLACK : WHITE;
             if (!ai) {
