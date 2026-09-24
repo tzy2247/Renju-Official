@@ -1103,20 +1103,190 @@ bool vcf_disproved(FastBoard& fb, int color, int max_depth, const Deadline& dead
     }
 }
 
-bool vct_disproved(FastBoard& fb, int color, int max_depth, const Deadline& deadline, unordered_map<uint64_t, TTEntry>& tt) {
+enum class VctResult { PROVEN, DISPROVEN, UNKNOWN };
+
+VctResult vct_check(FastBoard& fb, int color, int max_depth, const Deadline& deadline, unordered_map<uint64_t, TTEntry>& tt) {
     try {
         for (int d = VCT_ID_START; d <= max_depth; d += VCT_ID_STEP) {
             deadline.check();
-            if (search_vct(fb, color, d, deadline, tt).has_value()) return false;
+            if (search_vct(fb, color, d, deadline, tt).has_value()) {
+                return VctResult::PROVEN; // 找到了 VCT，证明对手有杀
+            }
         }
-        return true;
+        // 以现在的 search_vct (非四攻击未枚举所有应手)，无法证明 DISPROVEN
+        return VctResult::UNKNOWN;
     }
     catch (const TimeoutException&) {
-        return false;
+        return VctResult::UNKNOWN;
     }
 }
 
-// ================= 6.8 VCF 完整证明树 =================
+// ================= VCF 完整证明树 =================
+// ================= 6.9 VCT 完整证明树 (防反击重写版) =================
+struct VctNode {
+    Pos atk{ -1, -1 };
+    bool terminal{ false };
+    Pos win_five{ -1, -1 };
+    map<Pos, VctNode> replies;
+    VctNode() = default;
+    VctNode(const Pos& a, bool t, const Pos& w) : atk(a), terminal(t), win_five(w) {}
+};
+
+// 辅助函数：检查某一步棋是否形成了四或活三（即反击威胁）
+bool is_counter_threat(FastBoard& fb, int x, int y, int color) {
+    auto res = analyze_move_k(fb, x, y, color);
+    // get<2> 是四的数量，get<4> 是活三的数量
+    return get<2>(res) >= 1 || get<4>(res) >= 1;
+}
+
+optional<VctNode> search_vct_tree(FastBoard& fb, int color, int depth,
+    const Deadline& deadline, long long& node_budget)
+{
+    deadline.check();
+    if (--node_budget < 0) throw TimeoutException();
+
+    auto fives = five_moves(fb, color);
+    if (!fives.empty()) return VctNode(fives[0], true, fives[0]);
+    if (depth <= 0) return nullopt;
+
+    int opp = 1 - color;
+
+    // 1. 优先尝试冲四 (Fours)
+    auto fours = four_moves_full(fb, color);
+    for (auto& item : fours) {
+        const Pos& atk = item.first;
+        if (color == BLACK && is_ban_move_fb(fb, atk.first, atk.second)) continue;
+
+        BoardGuard guard(fb, atk.first, atk.second, color);
+        if (!five_moves(fb, opp).empty()) continue; // 对手直接成五，无效
+
+        auto fives_pts = five_point_cells_fb(fb, atk.first, atk.second, color);
+        if (fives_pts.empty()) continue;
+
+        VctNode node(atk, false, *fives_pts.begin());
+        bool all_win = true;
+
+        for (auto& df : fives_pts) {
+            deadline.check();
+            BoardGuard guard2(fb, df.first, df.second, opp);
+            if (is_win_at_fb(fb, df.first, df.second, opp)) { all_win = false; break; }
+
+            // 【关键修复】如果对手防守后形成了反击（四或活三），VCT 链条中断，此分支失败
+            if (is_counter_threat(fb, df.first, df.second, opp)) {
+                all_win = false; break;
+            }
+
+            auto sub = search_vct_tree(fb, color, depth - 2, deadline, node_budget);
+            if (!sub.has_value()) { all_win = false; break; }
+            node.replies[df] = move(*sub);
+        }
+        if (all_win) return node;
+    }
+
+    // 2. 尝试活三/做杀 (Threats)
+    auto threats = _threat_moves_scored(fb, color);
+    vector<pair<Pos, int>> pure_threats;
+    for (auto& t : threats) {
+        bool is_four = false;
+        for (auto& f : fours) if (f.first == t.first) { is_four = true; break; }
+        if (!is_four) pure_threats.push_back(t);
+    }
+
+    for (auto& item : pure_threats) {
+        const Pos& atk = item.first;
+        if (color == BLACK && is_ban_move_fb(fb, atk.first, atk.second)) continue;
+
+        BoardGuard guard(fb, atk.first, atk.second, color);
+        if (!five_moves(fb, opp).empty()) continue;
+
+        set<Pos> replies;
+        for (auto& p : fb.candidates()) {
+            if (opp == BLACK && is_ban_move_fb(fb, p.first, p.second)) continue;
+            replies.insert(p);
+        }
+
+        VctNode node(atk, false, Pos{ -1, -1 });
+        bool all_win = true;
+
+        for (auto& df : replies) {
+            deadline.check();
+            BoardGuard guard2(fb, df.first, df.second, opp);
+
+            if (is_win_at_fb(fb, df.first, df.second, opp)) { all_win = false; break; }
+
+            // 【关键修复】如果对手应手是反击（四或活三），VCT 链条中断
+            if (is_counter_threat(fb, df.first, df.second, opp)) {
+                all_win = false; break;
+            }
+
+            auto sub = search_vct_tree(fb, color, depth - 2, deadline, node_budget);
+            if (!sub.has_value()) { all_win = false; break; }
+            node.replies[df] = move(*sub);
+        }
+        if (all_win) return node;
+    }
+
+    return nullopt;
+}
+
+bool verify_vct_tree(FastBoard& fb, const VctNode& node, int color, const Deadline& dl) {
+    dl.check();
+    int opp = 1 - color;
+    if (fb.board[node.atk.first][node.atk.second] != EMPTY) return false;
+    if (color == BLACK && is_ban_move_fb(fb, node.atk.first, node.atk.second)) return false;
+
+    BoardGuard g(fb, node.atk.first, node.atk.second, color);
+    if (node.terminal) {
+        return is_win_at_fb(fb, node.atk.first, node.atk.second, color);
+    }
+    if (is_win_at_fb(fb, node.atk.first, node.atk.second, color)) return false;
+
+    auto res = analyze_move_k(fb, node.atk.first, node.atk.second, color);
+    set<Pos> defs;
+    bool is_four_attack = (get<2>(res) >= 1);
+
+    if (is_four_attack) {
+        auto fives_pts = five_point_cells_fb(fb, node.atk.first, node.atk.second, color);
+        defs.insert(fives_pts.begin(), fives_pts.end());
+    }
+    else {
+        for (auto& p : fb.candidates()) {
+            if (opp == BLACK && is_ban_move_fb(fb, p.first, p.second)) continue;
+            defs.insert(p);
+        }
+    }
+
+    if (defs.empty()) return true;
+
+    for (auto& df : defs) {
+        if (fb.board[df.first][df.second] != EMPTY) continue;
+
+        BoardGuard g2(fb, df.first, df.second, opp);
+        if (is_win_at_fb(fb, df.first, df.second, opp)) return false;
+
+        // 【关键验证】验证树必须再次确认对手应手不是反击
+        if (is_counter_threat(fb, df.first, df.second, opp)) return false;
+
+        auto it = node.replies.find(df);
+        if (it != node.replies.end()) {
+            if (!verify_vct_tree(fb, it->second, color, dl)) return false;
+        }
+        else {
+            if (is_four_attack && node.win_five.first != -1) {
+                if (fb.board[node.win_five.first][node.win_five.second] == EMPTY) {
+                    BoardGuard g3(fb, node.win_five.first, node.win_five.second, color);
+                    if (!is_win_at_fb(fb, node.win_five.first, node.win_five.second, color)) return false;
+                }
+                else { return false; }
+            }
+            else {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 struct MateNode {
     Pos atk{ -1, -1 };
     bool terminal{ false };
@@ -1416,14 +1586,10 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
     unordered_map<uint64_t, TTEntry>& vcf_tt,
     unordered_map<uint64_t, TTEntry>& vct_tt,
     unordered_map<uint64_t, TTEntry>& search_tt) {
+
+
     int opp = 1 - color;
 
-    // 0.【快速绝杀模式】在已复核的证明树上：零思考落子
-    if (mate_mode_active() && g_mate_color == color) {
-        auto fast = mate_mode_move(fb, color);
-        if (fast.has_value()) return fast.value();
-        mate_mode_reset();
-    }
 
     // 1. 立即成五  2. 挡对方成五  3. 自己双四
     auto fives = five_moves(fb, color);
@@ -1522,57 +1688,51 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
                 if (!five_moves(fb, opp).empty()) continue;
                 double dl_abs = min(get_time() + max(0.3, (v_end - get_time()) * 0.25), v_end);
                 Deadline dl(dl_abs);
-                if (vct_disproved(fb, opp, VCT_DEPTH, dl, vct_tt)) return mv;
             }
         }
     }
 
+    // ================= 收集根节点候选池 (Root Candidates) =================
+    set<Pos> root_cands; // 【定义候选池】
+
+    // ===== 1. VCT 完整证明树搜索 =====
+    // 既然信任 VCT 树，如果找到解，直接返回，不经过后续思考
     try {
-        auto path = search_vcf(fb, opp, VCF_DEPTH, sub_deadline(0.3), vcf_tt);
-        if (path.has_value()) {
-            Pos m = (*path)[0];
-            set<Pos> cand6;
-            BoardGuard guard(fb, m.first, m.second, opp);
-            auto defs = five_point_cells_fb(fb, m.first, m.second, opp);
-            auto def_cands = _defense_candidates(fb, color, defs);
-            for (auto& p : def_cands) cand6.insert(p);
+        optional<VctNode> vct_tree;
+        double vct_time = max(deadline.left() * 0.4, 1.0);
+        Deadline vct_dl(min(get_time() + vct_time, deadline.t - 0.8));
 
-            auto top5 = top_moves_fb(fb, color, 5);
-            for (auto& p : top5) cand6.insert(p);
-
-            vector<Pos> defs6(cand6.begin(), cand6.end());
-            sort(defs6.begin(), defs6.end(), [&](const Pos& a, const Pos& b) {
-                if (color == BLACK) {
-                    int da = _net_black_ban_delta(fb, a.first, a.second);
-                    int db = _net_black_ban_delta(fb, b.first, b.second);
-                    if (da != db) return da < db;
+        for (int d = 2; d <= VCT_DEPTH; d += 2) {
+            long long budget = 400000;
+            try {
+                auto r = search_vct_tree(fb, color, d, vct_dl, budget);
+                if (r.has_value()) {
+                    vct_tree = move(r);
+                    break;
                 }
-                return quick_eval_fb(fb, a.first, a.second, color) > quick_eval_fb(fb, b.first, b.second, color);
-                });
-            if ((int)defs6.size() > 12) defs6.resize(12);
+            }
+            catch (const TimeoutException&) { break; }
+            if (vct_dl.left() < 0.5) break;
+        }
 
-            double v_end = get_time() + deadline.left() * 0.5;
-            for (auto& mv : defs6) {
-                if (get_time() >= v_end || deadline.left() < 1.5) break;
-                BoardGuard guard2(fb, mv.first, mv.second, color);
-                if (!five_moves(fb, opp).empty()) continue;
-                double dl_abs = min(get_time() + max(0.3, (v_end - get_time()) * 0.2), v_end);
-                Deadline dl(dl_abs);
-                if (vcf_disproved(fb, opp, VCF_DEPTH, dl, vcf_tt)) return mv;
+        if (vct_tree.has_value()) {
+            bool ok = false;
+            try {
+                ok = verify_vct_tree(fb, *vct_tree, color, Deadline(get_time() + 3.0));
+            }
+            catch (const TimeoutException&) {
+                ok = false;
+            }
+            if (ok) {
+                return vct_tree->atk; // 【直接返回】VCT 树已证明，无需再思考
             }
         }
     }
     catch (const TimeoutException&) {}
 
-    // VCT：只用于选出"当前这一手"
-    try {
-        auto path = search_vct_id(fb, color, VCT_DEPTH, sub_deadline(0.35), vct_tt);
-        if (path.has_value()) return (*path)[0];
-    }
-    catch (const TimeoutException&) {}
-
+    // ===== 2. 防守对方 VCT (收集安全的防守点) =====
     set<Pos> cand8;
-    vector<Pos> defs8, ok8;
+    vector<Pos> ok8;
     try {
         auto path = search_vct_id(fb, opp, VCT_DEPTH, sub_deadline(0.4), vct_tt);
         if (path.has_value()) {
@@ -1603,7 +1763,7 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
             auto top5 = top_moves_fb(fb, color, 5);
             for (auto& p : top5) cand8.insert(p);
 
-            defs8 = vector<Pos>(cand8.begin(), cand8.end());
+            vector<Pos> defs8(cand8.begin(), cand8.end());
             sort(defs8.begin(), defs8.end(), [&](const Pos& a, const Pos& b) {
                 if (color == BLACK) {
                     int da = _net_black_ban_delta(fb, a.first, a.second);
@@ -1621,90 +1781,59 @@ optional<Pos> choose_move(FastBoard& fb, int color, const Deadline& deadline,
                 if (!five_moves(fb, opp).empty()) continue;
                 double dl_abs = min(get_time() + max(0.4, (v_end - get_time()) * 0.25), v_end);
                 Deadline dl(dl_abs);
-                if (vct_disproved(fb, opp, VCT_DEPTH, dl, vct_tt)) return mv;
-                ok8.push_back(mv);
+
+                auto res = vct_check(fb, opp, VCT_DEPTH, dl, vct_tt);
+                if (res != VctResult::PROVEN) {
+                    ok8.push_back(mv); // 对手没有 PROVEN 杀招，视为安全
+                }
             }
         }
     }
     catch (const TimeoutException&) {}
+    for (auto& p : ok8) root_cands.insert(p);
 
+    // ===== 3. 启发式进攻候选评估 (大幅收紧，防止无证明树的盲目连杀) =====
     try {
         vector<tuple<int, Pos, int>> ca;
-        auto fours = four_moves_full(fb, color);
-        // 【跳四修复】双四 > 连冲四 > 跳四 > 估值
-        sort(fours.begin(), fours.end(), [&](const pair<Pos, int>& a, const pair<Pos, int>& b) {
-            if (a.second != b.second) return a.second > b.second;
-            int qa = _four_quality(fb, a.first, color);
-            int qb = _four_quality(fb, b.first, color);
-            if (qa != qb) return qa > qb;
-            return quick_eval_fb(fb, a.first.first, a.first.second, color) > quick_eval_fb(fb, b.first.first, b.first.second, color);
-            });
-        int limit = min(8, (int)fours.size());
-        for (int i = 0; i < limit; ++i) ca.push_back(make_tuple(0, fours[i].first, fours[i].second));
 
-        auto threats = _threat_moves_scored(fb, color);
-        for (auto& item : threats) {
-            if (item.second >= 20) ca.push_back(make_tuple(1, item.first, 0));
-        }
-        if (ca.empty()) {
-            auto threes = three_moves(fb, color);
-            int lim3 = min(3, (int)threes.size());
-            for (int i = 0; i < lim3; ++i) ca.push_back(make_tuple(2, threes[i], 0));
-        }
+        if (!ca.empty()) {
+            set<Pos> cand8_ref = cand8;
+            sort(ca.begin(), ca.end(), [&](const tuple<int, Pos, int>& a, const tuple<int, Pos, int>& b) {
+                if (get<0>(a) != get<0>(b)) return get<0>(a) < get<0>(b);
+                bool a_in = cand8_ref.count(get<1>(a)) > 0;
+                bool b_in = cand8_ref.count(get<1>(b)) > 0;
+                return a_in > b_in;
+                });
+            if ((int)ca.size() > 5) ca.resize(5);
 
-        set<Pos> cand8_ref = cand8;
-        sort(ca.begin(), ca.end(), [&](const tuple<int, Pos, int>& a, const tuple<int, Pos, int>& b) {
-            if (get<0>(a) != get<0>(b)) return get<0>(a) < get<0>(b);
-            bool a_in = cand8_ref.count(get<1>(a)) > 0;
-            bool b_in = cand8_ref.count(get<1>(b)) > 0;
-            return a_in > b_in;
-            });
-        if ((int)ca.size() > 10) ca.resize(10);
+            double v_end2 = get_time() + deadline.left() * 0.35;
+            for (auto& item : ca) {
+                Pos mv = get<1>(item);
+                if (get_time() >= v_end2 || deadline.left() < 1.5) break;
 
-        double v_end2 = get_time() + deadline.left() * 0.35;
-        optional<Pos> best_ca;
-        optional<int> best_h;
-        for (auto& item : ca) {
-            int rank = get<0>(item);
-            Pos mv = get<1>(item);
-            int fp = get<2>(item);
-            if (get_time() >= v_end2 || deadline.left() < 1.5) break;
+                BoardGuard guard(fb, mv.first, mv.second, color);
+                if (!five_moves(fb, opp).empty()) continue;
 
-            optional<int> h_opt;
-            BoardGuard guard(fb, mv.first, mv.second, color);
-            if (!five_moves(fb, opp).empty()) continue;
-
-            double dl_abs = min(get_time() + max(0.3, (v_end2 - get_time()) * 0.3), v_end2);
-            Deadline dl(dl_abs);
-            if (vct_disproved(fb, opp, VCT_DEPTH, dl, vct_tt)) return mv;
-
-            if (fp == 1) {
-                auto qs = five_point_cells_fb(fb, mv.first, mv.second, color);
-                bool race_win = !qs.empty();
-                for (auto& q : qs) {
-                    if (opp == BLACK && is_ban_move_fb(fb, q.first, q.second)) continue;
-                    BoardGuard guard2(fb, q.first, q.second, opp);
-                    double dl2_abs = min(get_time() + max(0.3, (v_end2 - get_time()) * 0.2), v_end2);
-                    Deadline dl2(dl2_abs);
-                    if (!search_vcf(fb, color, VCF_DEPTH, dl2, vcf_tt).has_value() && !search_vct_id(fb, color, 12, dl2, vct_tt).has_value()) {
-                        race_win = false;
-                    }
-                }
-                if (race_win) return mv;
-            }
-            h_opt = (int)four_moves_full(fb, opp).size();
-
-            if (h_opt.has_value()) {
-                if (!best_h.has_value() || h_opt.value() < best_h.value()) {
-                    best_h = h_opt;
-                    best_ca = mv;
+                double dl_abs = min(get_time() + max(0.3, (v_end2 - get_time()) * 0.3), v_end2);
+                Deadline dl(dl_abs);
+                auto res = vct_check(fb, opp, VCT_DEPTH, dl, vct_tt);
+                if (res != VctResult::PROVEN) {
+                    root_cands.insert(mv); // 只有确认对手无杀，才勉强加入候选池
                 }
             }
         }
-        if (best_ca.has_value()) return best_ca;
-        if (!ok8.empty()) return _best_by_eval_fb(fb, ok8, color);
     }
     catch (const TimeoutException&) {}
+
+    // ===== 4. 补充基础候选，防止池子太小 =====
+    auto top5 = top_moves_fb(fb, color, 5);
+    for (auto& p : top5) root_cands.insert(p);
+
+    // ===== 5. 最终决策：Negamax 深度校验 =====
+    vector<Pos> final_cands(root_cands.begin(), root_cands.end());
+    if (final_cands.empty()) {
+        return fallback_move_fb(fb, color);
+    }
 
     optional<Pos> best_mv;
     for (int d : ID_DEPTHS) {
