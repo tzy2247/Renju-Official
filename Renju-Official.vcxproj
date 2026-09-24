@@ -139,7 +139,35 @@
     </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="Renju-Official.cpp" />
+    <ClCompile Include="config.cpp" />
+    <ClCompile Include="utils.cpp" />
+    <ClCompile Include="board.cpp" />
+    <ClCompile Include="analysis.cpp" />
+    <ClCompile Include="tactics.cpp" />
+    <ClCompile Include="eval.cpp" />
+    <ClCompile Include="search.cpp" />
+    <ClCompile Include="prooftree.cpp" />
+    <ClCompile Include="negamax.cpp" />
+    <ClCompile Include="decide.cpp" />
+    <ClCompile Include="ai.cpp" />
+    <ClCompile Include="protocol.cpp" />
+    <ClCompile Include="local_test.cpp" />
+    <ClCompile Include="main.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="config.h" />
+    <ClInclude Include="utils.h" />
+    <ClInclude Include="board.h" />
+    <ClInclude Include="analysis.h" />
+    <ClInclude Include="tactics.h" />
+    <ClInclude Include="eval.h" />
+    <ClInclude Include="search.h" />
+    <ClInclude Include="prooftree.h" />
+    <ClInclude Include="negamax.h" />
+    <ClInclude Include="decide.h" />
+    <ClInclude Include="ai.h" />
+    <ClInclude Include="protocol.h" />
+    <ClInclude Include="local_test.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
